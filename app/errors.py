@@ -39,6 +39,10 @@ E_MIGRATION_DIGEST_MISMATCH = "MIGRATION_DIGEST_MISMATCH"
 E_MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
 E_MIGRATION_COMPLETED = "MIGRATION_COMPLETED"
 E_MIGRATION_FAILED = "MIGRATION_FAILED"
+# 托管记录谱系的逻辑销毁（v1.6）
+E_CUSTODY_DESTROYED = "CUSTODY_DESTROYED"
+E_RECOVERY_DESTROYED = "RECOVERY_DESTROYED"
+E_MIGRATION_DESTROYED = "MIGRATION_DESTROYED"
 
 _STATUS = {
     E_BAD_REQUEST: 400,
@@ -70,6 +74,10 @@ _STATUS = {
     E_MIGRATION_CONFLICT: 409,
     E_MIGRATION_COMPLETED: 409,
     E_MIGRATION_FAILED: 409,
+    # 410 Gone：逻辑销毁终态，资源在线数据已被擦除，操作不可再继续
+    E_CUSTODY_DESTROYED: 410,
+    E_RECOVERY_DESTROYED: 410,
+    E_MIGRATION_DESTROYED: 410,
 }
 
 _MESSAGES = {
@@ -102,6 +110,9 @@ _MESSAGES = {
     E_MIGRATION_CONFLICT: "a different open migration already exists for this custody, or the same custody is already migrated",
     E_MIGRATION_COMPLETED: "migration session is already completed",
     E_MIGRATION_FAILED: "migration session has terminally failed (committed shares lost from memory); start a new migration session",
+    E_CUSTODY_DESTROYED: "custody record has been logically destroyed; online encrypted shards are erased and only a secret-free tombstone remains",
+    E_RECOVERY_DESTROYED: "recovery session was terminated because its custody lineage was destroyed",
+    E_MIGRATION_DESTROYED: "migration session was terminated because its custody lineage was destroyed",
 }
 
 

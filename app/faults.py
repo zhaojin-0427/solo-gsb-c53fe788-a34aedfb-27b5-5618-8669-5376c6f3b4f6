@@ -33,6 +33,19 @@ second submitter queues on the lock, proving the queued request can only fail
 fast with ``MIGRATION_FAILED`` once the gap detector commits the ``failed``
 terminal state — never complete the doomed session.
 
+The lineage-destruction flow (``scripts/race_destruction.py``) uses two more
+gates that pin the deterministic ordering between destruction and in-flight
+migration/recovery completion:
+
+* ``destruction.after_root_lock`` — right after the destroy transaction
+                                   acquires the root custody row lock.
+* ``destruction.after_lineage_locked`` — after the lineage fixpoint and every
+                                   in-flight session row lock are held but
+                                   before sessions are blocked and tombstones
+                                   are written; a submitter queued on the same
+                                   session row lock can then be released into a
+                                   committed-destroy world.
+
 Header protocol (only honored when fault injection is enabled):
 
 * ``X-Fault-Gate: <name>``        park at that gate until released

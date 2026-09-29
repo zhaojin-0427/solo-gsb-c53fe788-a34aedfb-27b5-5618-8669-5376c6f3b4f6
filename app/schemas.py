@@ -283,3 +283,30 @@ class MigrationShareSubmitOut(BaseModel):
     new_custody_id: str | None = None
     new_shard_count: int | None = None
     new_shard_digests: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Custody-lineage logical destruction (v1.6)
+# ---------------------------------------------------------------------------
+
+class DestructionRequestIn(BaseModel):
+    # 发起销毁的根托管记录；服务沿已完成迁移关系递归找出其全部后代
+    custody_id: str
+
+
+class DestructionReceiptOut(BaseModel):
+    receipt_id: str
+    root_custody_id: str
+    status: str
+    # 本次销毁实际置为墓碑的记录（同键重试且谱系此前已全部销毁时为空集）
+    destroyed_custody_ids: list[str]
+    # 已完成迁移谱系的递归全集（根 + 全部后代，含此前已销毁者）
+    lineage_custody_ids: list[str]
+    lineage_size: int
+    destroyed_count: int
+    shards_deleted: int
+    recoveries_blocked: int
+    migrations_blocked: int
+    created_at: datetime
+    # 明确边界：仅擦除服务在线数据，不宣称擦除外部备份
+    scope: str = "online_service_data_only_external_backups_not_erased"

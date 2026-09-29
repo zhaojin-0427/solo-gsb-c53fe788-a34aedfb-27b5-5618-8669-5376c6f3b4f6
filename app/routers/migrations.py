@@ -40,6 +40,7 @@ from ..errors import (
     E_BAD_REQUEST,
     E_BAD_SIGNATURE,
     E_CROSS_POLICY_SHARE,
+    E_CUSTODY_DESTROYED,
     E_DUPLICATE_SHARE,
     E_EPOCH_EXPIRED,
     E_EPOCH_REVOKED,
@@ -48,6 +49,7 @@ from ..errors import (
     E_INTEGRITY,
     E_MIGRATION_COMPLETED,
     E_MIGRATION_CONFLICT,
+    E_MIGRATION_DESTROYED,
     E_MIGRATION_DIGEST_MISMATCH,
     E_MIGRATION_FAILED,
     E_MIGRATION_SOURCE_INVALID,
@@ -118,6 +120,27 @@ async def _source_shard(conn, custody_id: str, custodian_id: str):
     )
 
 
+async def _require_source_shard(conn, mig, custodian_id: str):
+    """Source inventory shard for a custodian; destroyed lineages fail closed."""
+    shard = await _source_shard(conn, mig["source_custody_id"], custodian_id)
+    if shard is not None:
+        return shard
+    # 谱系销毁后在线加密分片已删除：旧会话不得再领取/提交任何分片。
+    if await conn.fetchval(
+        "SELECT 1 FROM key_custodies WHERE id=$1 AND status='destroyed'",
+        mig["source_custody_id"],
+    ):
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"custody_id": mig["source_custody_id"],
+                   "reason": "online_shards_erased"},
+        )
+    raise ApiError(
+        E_INTEGRITY,
+        basis={"reason": "no_shard_for_custodian", "custodian_id": custodian_id},
+    )
+
+
 async def _resolve_nonce(conn, migration_id: str, nonce_hex: str, custodian_id: str):
     try:
         nonce_hash = crypto.sha256_hex(bytes.fromhex(nonce_hex))
@@ -160,6 +183,14 @@ def _check_digests(mig, source_policy, target_policy) -> None:
 async def _guard_migration(conn, mig, source_policy, target_policy, now,
                            custodian_id: str | None) -> None:
     """Gates shared by nonce issue / shard claim / share submit."""
+    if mig["status"] == "destroyed":
+        # 谱系销毁在同一事务终结在途迁移：旧会话此后不得再下发源分片、
+        # 也不得完成（绝不可能在销毁后生成新后代记录）。
+        raise ApiError(
+            E_MIGRATION_DESTROYED,
+            basis={"migration_id": mig["id"], "reason": "custody_lineage_destroyed",
+                   "source_custody_id": mig["source_custody_id"]},
+        )
     if mig["status"] == "completed":
         raise ApiError(E_MIGRATION_COMPLETED, basis={"migration_id": mig["id"]})
     if mig["status"] == "failed":
@@ -245,6 +276,14 @@ async def start_migration(
                 if custody["tenant_id"] != tenant["id"]:
                     raise ApiError(E_FORBIDDEN,
                                    basis={"reason": "custody_belongs_to_other_tenant"})
+                # 销毁墓碑：已被（或祖先被）逻辑销毁的记录不得再发起迁移。
+                # custody 行锁与销毁事务串行，提交后的销毁在此被确定性拦截。
+                if custody["status"] == "destroyed":
+                    raise ApiError(
+                        E_CUSTODY_DESTROYED,
+                        basis={"custody_id": custody["id"],
+                               "reason": "custody_lineage_destroyed"},
+                    )
                 # 惰性过期：超过 TTL、或源侧已失效（custody 被轮换/撤销、源策略
                 # 版本被撤销/过期）的 open 会话在同源新事务（本事务随后提交）中
                 # 置 expired，释放两条部分唯一索引——失败后可用同键或新键安全重试，
@@ -312,10 +351,16 @@ async def start_migration(
                     # 即使该 custody 已有 open 会话，非法请求仍返回其真正的拒绝依据。
                     # 源必须仍有效：托管记录 active 且其策略版本未撤销/未过期。
                     if custody["status"] != "active" or source_policy["status"] == "revoked":
+                        reason = (
+                            "source_custody_destroyed"
+                            if custody["status"] == "destroyed"
+                            else "source_custody_not_active"
+                        )
                         raise ApiError(
                             E_MIGRATION_SOURCE_INVALID,
                             basis={"custody_id": custody["id"],
                                    "custody_status": custody["status"],
+                                   "reason": reason,
                                    "policy_id": custody["policy_id"],
                                    "version": custody["policy_version"],
                                    "policy_status": source_policy["status"]},
@@ -554,12 +599,7 @@ async def issue_nonce(body: MigrationNonceRequestIn, request: Request,
             await _guard_migration(conn, mig_row, source_policy, target_policy, now,
                                    custodian["id"])
 
-            shard = await _source_shard(conn, mig_row["source_custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_source_shard(conn, mig_row, custodian["id"])
             point_x = shard["point_x"]
             shard_digest = shard["shard_digest"]
 
@@ -648,12 +688,7 @@ async def claim_shard(body: MigrationShardClaimIn, request: Request,
                 raise ApiError(E_NONCE_USED, basis={"nonce_id": nonce_row["id"],
                                                     "reason": "nonce_spent"})
 
-            shard = await _source_shard(conn, mig["source_custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_source_shard(conn, mig, custodian["id"])
             try:
                 blob = crypto.decrypt_shard(
                     settings.shard_master_key_bytes, shard["id"], bytes(shard["ciphertext"])
@@ -775,12 +810,7 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
                                basis={"migration_id": body.migration_id,
                                       "custodian_id": custodian["id"]})
 
-            shard = await _source_shard(conn, mig["source_custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_source_shard(conn, mig, custodian["id"])
 
             blob = bytes.fromhex(body.shard_hex)
             if len(blob) > 8192:

@@ -12,6 +12,7 @@ from ..errors import (
     E_BAD_REQUEST,
     E_BAD_SIGNATURE,
     E_CROSS_POLICY_SHARE,
+    E_CUSTODY_DESTROYED,
     E_DUPLICATE_SHARE,
     E_EPOCH_EXPIRED,
     E_EPOCH_REVOKED,
@@ -19,6 +20,7 @@ from ..errors import (
     E_INTEGRITY,
     E_NONCE_USED,
     E_NOT_FOUND,
+    E_RECOVERY_DESTROYED,
     E_SESSION_COMPLETED,
     E_SESSION_EXPIRED,
     E_SHARE_DIGEST,
@@ -73,10 +75,44 @@ async def _custody_shard(conn, custody_id: str, custodian_id: str):
     )
 
 
+async def _require_custody_shard(conn, sess, custodian_id: str):
+    """Inventory shard for a custodian; destroyed lineages fail closed."""
+    shard = await _custody_shard(conn, sess["custody_id"], custodian_id)
+    if shard is not None:
+        return shard
+    # 谱系销毁后在线加密分片已删除：旧会话不得再领取/提交任何分片或密文。
+    if await conn.fetchval(
+        "SELECT 1 FROM key_custodies WHERE id=$1 AND status='destroyed'",
+        sess["custody_id"],
+    ):
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"custody_id": sess["custody_id"], "reason": "online_shards_erased"},
+        )
+    raise ApiError(
+        E_INTEGRITY,
+        basis={"reason": "no_shard_for_custodian", "custodian_id": custodian_id},
+    )
+
+
 async def _guard_open_session(conn, sess, policy, custody, now, custodian_id: str) -> None:
     """All gates shared by nonce issue / shard claim / share submit."""
+    if sess["status"] == "destroyed":
+        # 托管谱系被逻辑销毁时，在途恢复在销毁事务中被同事务终结；
+        # 此后旧会话不得再下发分片或密文。
+        raise ApiError(
+            E_RECOVERY_DESTROYED,
+            basis={"session_id": sess["id"], "custody_id": sess["custody_id"],
+                   "reason": "custody_lineage_destroyed"},
+        )
     if sess["status"] == "completed":
         raise ApiError(E_SESSION_COMPLETED, basis={"session_id": sess["id"]})
+    if custody["status"] == "destroyed":
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"custody_id": sess["custody_id"],
+                   "reason": "custody_lineage_destroyed"},
+        )
     if now >= sess["valid_until"]:
         raise ApiError(E_SESSION_EXPIRED,
                        basis={"valid_until": str(sess["valid_until"]), "now": str(now)})
@@ -123,13 +159,23 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
     ttl = min(ttl, settings.recovery_max_ttl)
     async with pool.acquire() as conn:
         async with conn.transaction():
-            custody = await conn.fetchrow("SELECT * FROM key_custodies WHERE id = $1", body.custody_id)
+            # custody 行锁：与谱系销毁严格串行——销毁提交后不可能再为本记录
+            # 新建在途恢复；销毁在途时本事务也会被挡到其提交后再由守卫拒绝。
+            custody = await conn.fetchrow(
+                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.custody_id
+            )
             if custody is None:
                 raise ApiError(E_NOT_FOUND, basis={"custody_id": body.custody_id})
             if custody["tenant_id"] != tenant["id"]:
                 raise ApiError(E_FORBIDDEN, basis={"reason": "custody_belongs_to_other_tenant"})
             policy = await repo.get_policy_version(conn, custody["policy_id"], custody["policy_version"])
             now = await conn.fetchval("SELECT now()")
+            if custody["status"] == "destroyed":
+                raise ApiError(
+                    E_CUSTODY_DESTROYED,
+                    basis={"custody_id": body.custody_id,
+                           "reason": "custody_lineage_destroyed"},
+                )
             if policy["status"] == "revoked" or custody["status"] == "revoked":
                 raise ApiError(
                     E_EPOCH_REVOKED,
@@ -206,12 +252,7 @@ async def issue_nonce(body: NonceRequestIn, request: Request, custodian=deps.Cus
             now = await conn.fetchval("SELECT now()")
             await _guard_open_session(conn, sess, policy, custody, now, custodian["id"])
 
-            shard = await _custody_shard(conn, sess["custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_custody_shard(conn, sess, custodian["id"])
             point_x = shard["point_x"]
             shard_digest = shard["shard_digest"]
 
@@ -297,12 +338,7 @@ async def claim_shard(body: ShardClaimIn, request: Request, custodian=deps.Custo
             if nonce_row["spent"]:
                 raise ApiError(E_NONCE_USED, basis={"nonce_id": nonce_row["id"], "reason": "nonce_spent"})
 
-            shard = await _custody_shard(conn, sess["custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_custody_shard(conn, sess, custodian["id"])
             # 服务端自检：库存密文必须能解开且摘要自洽
             try:
                 blob = crypto.decrypt_shard(
@@ -431,12 +467,7 @@ async def submit_share(body: ShareSubmitIn, request: Request, custodian=deps.Cus
                                basis={"session_id": body.session_id, "custodian_id": custodian["id"]})
 
             # 4) 分片归属：提交者在该托管下必须有且仅有自己点位的库存分片
-            shard = await _custody_shard(conn, sess["custody_id"], custodian["id"])
-            if shard is None:
-                raise ApiError(
-                    E_INTEGRITY,
-                    basis={"reason": "no_shard_for_custodian", "custodian_id": custodian["id"]},
-                )
+            shard = await _require_custody_shard(conn, sess, custodian["id"])
 
             # 5) 点位与库存摘要：先验“货”再花钱（nonce），错误分片有确定性依据
             blob = bytes.fromhex(body.shard_hex)

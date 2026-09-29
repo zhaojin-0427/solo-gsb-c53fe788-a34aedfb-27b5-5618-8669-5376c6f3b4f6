@@ -55,13 +55,21 @@ CREATE TABLE IF NOT EXISTS key_custodies (
     tenant_id         TEXT NOT NULL REFERENCES tenants(id),
     policy_id         TEXT NOT NULL,
     policy_version    INTEGER NOT NULL,
-    secret_digest     TEXT NOT NULL,
-    secret_length     INTEGER NOT NULL,
+    -- 逻辑销毁（v1.6）后：记录作为“无秘密墓碑”保留——secret_digest 置 NULL、
+    -- secret_length 置 NULL，shards 行整体删除（加密分片只在在线库中被擦除）。
+    secret_digest     TEXT,
+    secret_length     INTEGER,
     epoch_index       INTEGER NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'active',  -- active | rotated | revoked
+    -- active | rotated | revoked | destroyed
+    status            TEXT NOT NULL DEFAULT 'active',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    destroyed_at      TIMESTAMPTZ,
     FOREIGN KEY (policy_id, policy_version) REFERENCES policies(id, version)
 );
+-- 旧库平滑升级：nullable + 销毁时间戳列对既有库幂等生效。
+ALTER TABLE key_custodies ALTER COLUMN secret_digest DROP NOT NULL;
+ALTER TABLE key_custodies ALTER COLUMN secret_length DROP NOT NULL;
+ALTER TABLE key_custodies ADD COLUMN IF NOT EXISTS destroyed_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_custody_tenant ON key_custodies(tenant_id);
 
 CREATE TABLE IF NOT EXISTS shards (
@@ -84,7 +92,8 @@ CREATE TABLE IF NOT EXISTS recovery_sessions (
     policy_version    INTEGER NOT NULL,
     epoch_index       INTEGER NOT NULL,
     request_digest    TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'open',  -- open | completed
+    -- open | completed | destroyed（销毁在同一事务内终结所有在途恢复）
+    status            TEXT NOT NULL DEFAULT 'open',
     recovery_pubkey   TEXT NOT NULL,
     valid_until       TIMESTAMPTZ NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -132,7 +141,8 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
     target_version      INTEGER NOT NULL,
     target_digest       TEXT NOT NULL,          -- 创建时固化的目标策略版本摘要
     idempotency_key_hash TEXT NOT NULL,         -- 只存幂等键摘要
-    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired | failed
+    -- open | completed | expired | failed | destroyed（销毁终结在途迁移）
+    status              TEXT NOT NULL DEFAULT 'open',
     new_custody_id      TEXT REFERENCES key_custodies(id),
     valid_until         TIMESTAMPTZ NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -193,6 +203,34 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_seq ON audit_log(tenant_id, seq);
+
+-- 托管记录谱系的逻辑销毁回执（v1.6）。销毁沿 migration_sessions 中“已完成迁移”
+-- 关系（source_custody_id -> new_custody_id）从根记录递归找出全部后代，在同一
+-- 事务内阻断其在途恢复/迁移、把托管记录置为无秘密墓碑、删除在线库加密分片。
+-- 回执只保存标识、计数与幂等键摘要；墓碑与哈希链审计均可重放，销毁不触及
+-- 任何外部备份（不声称对备份介质的擦除）。
+CREATE TABLE IF NOT EXISTS destruction_receipts (
+    id                      TEXT PRIMARY KEY,
+    tenant_id               TEXT NOT NULL REFERENCES tenants(id),
+    root_custody_id         TEXT NOT NULL,       -- 发起销毁时指定的记录
+    idempotency_key_hash    TEXT NOT NULL,       -- 只存幂等键摘要
+    -- 本次销毁实际置为墓碑的记录（同键重试时可能为空集：全部此前已销毁）
+    destroyed_custody_ids   TEXT[] NOT NULL DEFAULT '{}',
+    lineage_custody_ids     TEXT[] NOT NULL DEFAULT '{}',  -- 递归谱系全集（含此前已销毁）
+    shards_deleted          INTEGER NOT NULL DEFAULT 0,
+    recoveries_blocked      INTEGER NOT NULL DEFAULT 0,
+    migrations_blocked      INTEGER NOT NULL DEFAULT 0,
+    status                  TEXT NOT NULL DEFAULT 'completed',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_destruction_tenant ON destruction_receipts(tenant_id);
+-- 同租户同一幂等键全局唯一：重试一律返回同一份销毁回执（不重复执行、不重复留痕）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_destruction_idem
+    ON destruction_receipts(tenant_id, idempotency_key_hash);
+ALTER TABLE destruction_receipts ADD COLUMN IF NOT EXISTS lineage_custody_ids TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE destruction_receipts ADD COLUMN IF NOT EXISTS shards_deleted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE destruction_receipts ADD COLUMN IF NOT EXISTS recoveries_blocked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE destruction_receipts ADD COLUMN IF NOT EXISTS migrations_blocked INTEGER NOT NULL DEFAULT 0;
 """
 
 
