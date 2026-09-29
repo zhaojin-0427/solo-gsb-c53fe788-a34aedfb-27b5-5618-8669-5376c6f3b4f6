@@ -33,6 +33,16 @@ second submitter queues on the lock, proving the queued request can only fail
 fast with ``MIGRATION_FAILED`` once the gap detector commits the ``failed``
 terminal state — never complete the doomed session.
 
+Logical-destruction interleavings (v1.6, ``scripts/race_destruction.py``) add:
+
+* ``destruction.after_lineage_lock`` — after every custody row of the migration
+  lineage is locked but before the in-flight recovery/migration session rows are
+  locked. A request parked here lets a migration-completing share submit or a
+  recovery shard claim queue on its locks, pinning the deterministic ordering of
+  destruction versus in-flight recovery/migration and proving the queued, older
+  session can no longer hand out shard plaintext / wrapped ciphertext nor insert
+  a missed descendant once destruction wins.
+
 Header protocol (only honored when fault injection is enabled):
 
 * ``X-Fault-Gate: <name>``        park at that gate until released

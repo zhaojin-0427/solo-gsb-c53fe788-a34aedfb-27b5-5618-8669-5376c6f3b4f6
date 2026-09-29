@@ -12,6 +12,7 @@ from ..errors import (
     E_BAD_REQUEST,
     E_BAD_SIGNATURE,
     E_CROSS_POLICY_SHARE,
+    E_CUSTODY_DESTROYED,
     E_DUPLICATE_SHARE,
     E_EPOCH_EXPIRED,
     E_EPOCH_REVOKED,
@@ -75,6 +76,15 @@ async def _custody_shard(conn, custody_id: str, custodian_id: str):
 
 async def _guard_open_session(conn, sess, policy, custody, now, custodian_id: str) -> None:
     """All gates shared by nonce issue / shard claim / share submit."""
+    # 逻辑销毁终态：该会话（及其谱系）的在线分片已删除，任何旧会话请求
+    # （nonce/claim/submit）确定性拒绝，绝不再下发分片或密文。
+    if sess["status"] == "destroyed" or (custody is not None and custody["status"] == "destroyed"):
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"session_id": sess["id"], "custody_id": sess["custody_id"],
+                   "session_status": sess["status"],
+                   "custody_status": custody["status"] if custody is not None else "missing"},
+        )
     if sess["status"] == "completed":
         raise ApiError(E_SESSION_COMPLETED, basis={"session_id": sess["id"]})
     if now >= sess["valid_until"]:
@@ -123,13 +133,21 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
     ttl = min(ttl, settings.recovery_max_ttl)
     async with pool.acquire() as conn:
         async with conn.transaction():
-            custody = await conn.fetchrow("SELECT * FROM key_custodies WHERE id = $1", body.custody_id)
+            # custody 行锁：与逻辑销毁同序串行，销毁提交后不得再建恢复会话。
+            custody = await conn.fetchrow(
+                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.custody_id
+            )
             if custody is None:
                 raise ApiError(E_NOT_FOUND, basis={"custody_id": body.custody_id})
             if custody["tenant_id"] != tenant["id"]:
                 raise ApiError(E_FORBIDDEN, basis={"reason": "custody_belongs_to_other_tenant"})
             policy = await repo.get_policy_version(conn, custody["policy_id"], custody["policy_version"])
             now = await conn.fetchval("SELECT now()")
+            if custody["status"] == "destroyed":
+                raise ApiError(
+                    E_CUSTODY_DESTROYED,
+                    basis={"custody_id": custody["id"], "custody_status": custody["status"]},
+                )
             if policy["status"] == "revoked" or custody["status"] == "revoked":
                 raise ApiError(
                     E_EPOCH_REVOKED,
@@ -194,15 +212,21 @@ async def issue_nonce(body: NonceRequestIn, request: Request, custodian=deps.Cus
         tx = conn.transaction()
         await tx.start()
         try:
-            # 会话级互斥：与领片/提交同一把行锁，杜绝“发 nonce/提交”竞态
+            # 全局锁序：custody 行先于 recovery 会话行（与销毁/提交一致，
+            # 杜绝销毁 × nonce 发放的锁序反转死锁）。
             sess = await conn.fetchrow(
-                "SELECT * FROM recovery_sessions WHERE id=$1 FOR UPDATE", body.session_id
+                "SELECT * FROM recovery_sessions WHERE id=$1", body.session_id
             )
             if sess is None:
                 raise ApiError(E_NOT_FOUND, basis={"session_id": body.session_id})
+            custody = await conn.fetchrow(
+                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", sess["custody_id"]
+            )
+            sess = await conn.fetchrow(
+                "SELECT * FROM recovery_sessions WHERE id=$1 FOR UPDATE", body.session_id
+            )
             sess_tenant = sess["tenant_id"]
             policy = await repo.get_policy_version(conn, sess["policy_id"], sess["policy_version"])
-            custody = await conn.fetchrow("SELECT * FROM key_custodies WHERE id = $1", sess["custody_id"])
             now = await conn.fetchval("SELECT now()")
             await _guard_open_session(conn, sess, policy, custody, now, custodian["id"])
 
@@ -282,14 +306,21 @@ async def claim_shard(body: ShardClaimIn, request: Request, custodian=deps.Custo
         tx = conn.transaction()
         await tx.start()
         try:
+            # 全局锁序：custody 行先于 recovery 会话行（与销毁/提交一致，
+            # 杜绝销毁 × 领片的锁序反转死锁；排队领片在销毁后只得到 410）。
             sess = await conn.fetchrow(
-                "SELECT * FROM recovery_sessions WHERE id=$1 FOR UPDATE", body.session_id
+                "SELECT * FROM recovery_sessions WHERE id=$1", body.session_id
             )
             if sess is None:
                 raise ApiError(E_NOT_FOUND, basis={"session_id": body.session_id})
+            custody = await conn.fetchrow(
+                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", sess["custody_id"]
+            )
+            sess = await conn.fetchrow(
+                "SELECT * FROM recovery_sessions WHERE id=$1 FOR UPDATE", body.session_id
+            )
             sess_tenant = sess["tenant_id"]
             policy = await repo.get_policy_version(conn, sess["policy_id"], sess["policy_version"])
-            custody = await conn.fetchrow("SELECT * FROM key_custodies WHERE id = $1", sess["custody_id"])
             now = await conn.fetchval("SELECT now()")
             await _guard_open_session(conn, sess, policy, custody, now, custodian["id"])
 
@@ -401,16 +432,24 @@ async def submit_share(body: ShareSubmitIn, request: Request, custodian=deps.Cus
             await tx.rollback()
 
         try:
-            # 会话行锁：同一会话的所有提交完全串行，消除并发竞态
+            # 全局锁序：custody 行先于 recovery 会话行——与逻辑销毁路径一致，
+            # 销毁 × 提交永不死锁：销毁已把该 custody 谱系的会话行锁定并置
+            # destroyed 后，本路径只能在 guard 上得到确定性 CUSTODY_DESTROYED。
+            sess = await conn.fetchrow(
+                "SELECT * FROM recovery_sessions WHERE id=$1", body.session_id
+            )
+            if sess is None:
+                raise ApiError(E_NOT_FOUND, basis={"session_id": body.session_id})
+            custody = await conn.fetchrow(
+                "SELECT * FROM key_custodies WHERE id=$1 FOR UPDATE", sess["custody_id"]
+            )
+            # 会话行锁：同一会话的所有提交完全串行，消除并发竞态。
             sess = await conn.fetchrow(
                 "SELECT * FROM recovery_sessions WHERE id=$1 FOR UPDATE", body.session_id
             )
             await faults.maybe_park(request, "submit.after_lock")
-            if sess is None:
-                raise ApiError(E_NOT_FOUND, basis={"session_id": body.session_id})
             sess_tenant = sess["tenant_id"]
             policy = await repo.get_policy_version(conn, sess["policy_id"], sess["policy_version"])
-            custody = await conn.fetchrow("SELECT * FROM key_custodies WHERE id=$1", sess["custody_id"])
             now = await conn.fetchval("SELECT now()")
 
             # 1) 会话状态/时效 + epoch + 策略成员

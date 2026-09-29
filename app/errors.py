@@ -39,6 +39,8 @@ E_MIGRATION_DIGEST_MISMATCH = "MIGRATION_DIGEST_MISMATCH"
 E_MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
 E_MIGRATION_COMPLETED = "MIGRATION_COMPLETED"
 E_MIGRATION_FAILED = "MIGRATION_FAILED"
+# v1.6 托管记录谱系逻辑销毁
+E_CUSTODY_DESTROYED = "CUSTODY_DESTROYED"
 
 _STATUS = {
     E_BAD_REQUEST: 400,
@@ -70,6 +72,7 @@ _STATUS = {
     E_MIGRATION_CONFLICT: 409,
     E_MIGRATION_COMPLETED: 409,
     E_MIGRATION_FAILED: 409,
+    E_CUSTODY_DESTROYED: 410,
 }
 
 _MESSAGES = {
@@ -102,6 +105,7 @@ _MESSAGES = {
     E_MIGRATION_CONFLICT: "a different open migration already exists for this custody, or the same custody is already migrated",
     E_MIGRATION_COMPLETED: "migration session is already completed",
     E_MIGRATION_FAILED: "migration session has terminally failed (committed shares lost from memory); start a new migration session",
+    E_CUSTODY_DESTROYED: "custody record (or its migration lineage) has been logically destroyed; online shards are deleted and in-flight recovery/migration is blocked",
 }
 
 

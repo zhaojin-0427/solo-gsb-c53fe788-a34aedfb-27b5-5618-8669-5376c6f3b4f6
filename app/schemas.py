@@ -283,3 +283,28 @@ class MigrationShareSubmitOut(BaseModel):
     new_custody_id: str | None = None
     new_shard_count: int | None = None
     new_shard_digests: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Logical record-lineage destruction (v1.6)
+# ---------------------------------------------------------------------------
+
+class DestructionStartIn(BaseModel):
+    # 待销毁谱系的根托管记录：销毁覆盖该记录及其沿“已完成迁移关系”的全部后代
+    root_custody_id: str
+
+
+class DestructionReceiptOut(BaseModel):
+    destruction_id: str
+    status: str
+    root_custody_id: str
+    # 幂等键只回显其 sha256 摘要；同键重试返回同一份回执
+    idempotency_key_digest: str
+    custody_count: int
+    recovery_blocked: int
+    migration_blocked: int
+    shards_deleted: int
+    custody_ids: list[str]
+    created_at: datetime
+    # 销毁边界：仅擦除服务在线数据，不宣称擦除外部备份
+    scope: str = "online_service_data_only"

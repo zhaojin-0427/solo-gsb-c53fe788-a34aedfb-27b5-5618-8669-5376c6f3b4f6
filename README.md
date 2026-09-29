@@ -14,6 +14,21 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 
 技术栈：Python 3.12 · FastAPI · PostgreSQL 16 · `cryptography` · Docker Compose。
 
+> **新功能（v1.6）托管记录谱系逻辑销毁**：租户对任一托管记录携带**幂等键**发起逻辑销毁
+> （`POST /destructions`）。服务沿**已完成的迁移关系**（`migration_sessions.new_custody_id`）
+> 找出指定记录及其**全部后代**，在**同一事务**、按与迁移/恢复路径一致的全局行锁序
+> （custody 行先于会话行）内：① 把谱系上的**在途恢复/迁移会话**置为不可复活的
+> `destroyed` 终态，阻断其在途恢复与迁移；② 把全部托管记录置 `destroyed`（保留**无秘密的
+> 墓碑**：id、策略坐标、`secret_digest`、长度/epoch）；③ **删除在线库中的加密分片**
+> （`shards` 密文行）；④ 写入无明文、可重放的 `destruction.complete` 审计与一份**幂等销毁
+> 回执**。事务**提交成功后**再清理这些会话在进程内的待累计分片。销毁与迁移完成、分片领取
+> 或份额提交并发时先后由行锁**确定性**地决定：销毁提交后，旧会话不得再下发分片明文或一次性
+> 密文（统一 `CUSTODY_DESTROYED`/410），输掉交错的迁移也不可能插入“漏删的后代”——若迁移先
+> 提交，销毁的谱系展开会把新生后代一并纳入并删除其分片。同键重试返回**同一份销毁回执**
+> （200），同键换根为 `IDEMPOTENCY_CONFLICT`，跨租户请求一律 `FORBIDDEN`。销毁**仅覆盖服务
+> 在线数据**（回执 `scope=online_service_data_only`），**不宣称擦除数据库/存储的外部备份**。
+> 并发交错的回归验证见 `scripts/race_destruction.py`（D1–D8）。
+
 > **修复要点（v1.5）**：修复**跨策略迁移在待累计分片丢失后卡死**的问题。旧代码里，首名托管人
 > 已提交分片（数据库计数=1）后若 API 进程重启或内存池淘汰该分片，另一名托管人的提交会让
 > 数据库计数达到源门限、内存分片却不足——`/migrations/shares` 返回 `THRESHOLD_NOT_MET`
@@ -116,17 +131,18 @@ docker compose exec api python -m app.seed
 ## 2. 快速体验（端到端）
 
 容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移、
-迁移缺片故障转移与审计链重放：
+迁移缺片故障转移、**托管记录谱系逻辑销毁**与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 端到端验收（scripts.demo，108 项）
+# 3) 谱系逻辑销毁回归（scripts.race_destruction，D1–D8）
+# 4) 端到端验收（scripts.demo，含销毁全流程）
 docker compose --profile demo run --rm demo
 ```
 
-期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION FAILOVER CHECKS PASSED`
-与 `ALL CHECKS PASSED`。
+期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION FAILOVER CHECKS PASSED`、
+`DESTRUCTION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
 
 `scripts.race_recovery.py` 在进程内以真实 ASGI + 真实 PostgreSQL 行锁运行，通过仅测试构建启用的
 故障注入闸门（`KEYVAULT_FAULT_INJECTION=1`，API 服务默认关闭、关闭时零开销）精确钉住交错点：
@@ -138,13 +154,18 @@ docker compose --profile demo run --rm demo
 `PendingShareStore`，数据库提交计数保留）：断言检出缺片的提交把迁移会话同事务置为可查询的
 `failed` 终态、本次分片完整撤销（计数/nonce/内存）、行锁等待者只得 `MIGRATION_FAILED`、
 新幂等键与同一键都能从源记录安全重新发起且只产生一个新托管记录、`migration.fail` 无明文入审计链。
+`scripts.race_destruction.py` 钉住**逻辑销毁 × 迁移完成/分片领取/份额提交**的行锁交错
+（销毁在持谱系 custody 锁、会话锁前 park，使在途请求排队）：断言先后确定、输掉交错的旧会话
+只得到 `CUSTODY_DESTROYED`（不再下发分片/密文、不产生漏删后代）、迁移先赢时新后代必被纳入
+销毁、同键返回同一回执、跨租户拒绝、待累计分片在提交后清空。
 本地单独运行：
 
 ```bash
 KEYVAULT_FAULT_INJECTION=1 \
 KEYVAULT_DATABASE_URL=postgresql://keyvault:keyvault@localhost:5432/keyvault \
-python -m scripts.race_recovery   # 并发回滚竞态
-python -m scripts.race_migration  # 迁移缺片故障转移
+python -m scripts.race_recovery      # 并发回滚竞态
+python -m scripts.race_migration     # 迁移缺片故障转移
+python -m scripts.race_destruction   # 谱系逻辑销毁并发交错
 ```
 
 以下用 curl 走一遍核心流程（演示凭据见 `python -m app.seed` 输出）：
@@ -323,6 +344,71 @@ curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
 - 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：同键并发恰有一次 201、另一次重放 200；
   不同键并发恰有一次 201、另一次 `MIGRATION_CONFLICT`。
 
+### 2.10 托管记录谱系逻辑销毁（curl 流程）
+
+对一份托管记录（无论它是否迁移过、迁移了几代）发起逻辑销毁：服务沿**已完成迁移关系**找出
+该记录及全部后代，在同一事务阻断在途、删除在线加密分片。
+
+```bash
+TENANT=tsec_...   # python -m app.seed 输出
+
+# (1) 发起销毁：必须带 Idempotency-Key；root_custody_id 为谱系中任意一代记录
+curl -s -X POST localhost:8000/destructions -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: destroy-2026-09-29-0001' \
+  -d '{"root_custody_id":"cus_secret_..."}'
+# -> 201 销毁回执：
+# {
+#   "destruction_id": "des_...",
+#   "status": "completed",
+#   "root_custody_id": "cus_secret_...",
+#   "idempotency_key_digest": "<sha256(Idempotency-Key)>",
+#   "custody_count": 3,            # 覆盖的谱系记录数（根 + 全部后代）
+#   "recovery_blocked": 1,         # 被置 destroyed 的在途恢复会话数
+#   "migration_blocked": 1,        # 被置 destroyed 的在途迁移会话数
+#   "shards_deleted": 9,           # 删除的在线加密分片数（3 代 × 每代 3 片）
+#   "custody_ids": ["cus_secret_...", "...", "..."],
+#   "scope": "online_service_data_only"   # 仅在线数据；不宣称擦除外部备份
+# }
+
+# (2) 同键重试（网络抖动/客户端重放）-> 200 + 同一份回执，不重复销毁、不重复留痕
+curl -s -X POST localhost:8000/destructions -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: destroy-2026-09-29-0001' \
+  -d '{"root_custody_id":"cus_secret_..."}'
+
+# (3) 查询销毁回执（排障/合规留存）
+curl -s localhost:8000/destructions/des_... -H "X-API-Key: $TENANT"
+```
+
+销毁提交后，谱系上旧会话的一切请求确定性返回 `CUSTODY_DESTROYED`（HTTP 410），
+`GET /recoveries/{id}` / `GET /migrations/{id}` 可见 `status=destroyed`：
+
+```bash
+# 旧恢复会话：nonce/claim/submit 全部 410，不再下发分片明文或一次性密文
+curl -s -X POST localhost:8000/recoveries/nonces -H "X-API-Key: $CUSTODIAN_KEY" \
+  -H 'Content-Type: application/json' -d '{"session_id":"rec_..."}'
+# -> {"error":{"code":"CUSTODY_DESTROYED", ...}}
+
+# 旧迁移会话：nonce/claim/submit 全部 410，不可能完成迁移或生成漏删的后代
+# 对已销毁记录再发起恢复/迁移同样 410；不同幂等键重复销毁已毁根 -> 零增量回执
+```
+
+**销毁语义与边界**：
+
+- 必须携带 `Idempotency-Key`（缺失/超长 → `BAD_REQUEST`）；幂等键只存 SHA256 摘要。
+  同键同体重放返回 200 同回执；同键换根 → `IDEMPOTENCY_CONFLICT`；不同键对已销毁根
+  再次销毁返回一份零增量回执（`shards_deleted=0`、谱系仍完整列出），销毁天然幂等收敛。
+- 谱系**只沿已完成迁移关系前进**：`open`/`failed`/`expired` 的迁移没有 `new_custody_id`，
+  不会产生后代，故不影响展开；被纳入的在途（open）恢复/迁移会话在同一事务内置 `destroyed`。
+- **并发确定性**：迁移完成、分片领取、份额提交与销毁共用同一全局行锁序
+  （custody 行按 id、会话行按 id）。迁移提交先持锁则销毁等待其提交，随后把新生后代一并
+  纳入销毁（后代分片同样删除，绝不漏删）；销毁先持锁则在途提交/领取排队后只得 410，
+  既不下发分片/密文，也不产生新托管记录。事务提交后才清理这些会话的进程内待累计分片。
+- 销毁只删除在线库 `shards` 密文与标记托管记录；墓碑（id、策略版本坐标、`secret_digest`、
+  长度、epoch、销毁时刻）与全部既有审计行保留，审计哈希链继续可重放、可校验。
+- **边界声明**：`scope=online_service_data_only`——仅擦除本服务在线数据库中的加密分片与
+  在途会话，不宣称、也无法擦除数据库快照、备份磁带、对象存储版本、网关/客户端缓存等
+  **外部副本**；合规上的“彻底擦除”需由底层备份生命周期与介质策略另行保证。
+
 轮换 / 撤销：
 
 ```bash
@@ -363,6 +449,8 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `POST /migrations/nonces` | 托管人 | 领取迁移一次性挑战值 nonce（仅源策略成员） |
 | `POST /migrations/shards/claim` | 托管人 | 验身份后领取**本人源分片**明文 + 迁移待签名报文 |
 | `POST /migrations/shares` | 托管人 | 提交本人源分片+签名；源门限满足时同事务按目标策略重新分片并返回新 custody |
+| `POST /destructions` | 租户 | 携带 `Idempotency-Key`，沿已完成迁移关系逻辑销毁指定记录及全部后代（阻断在途、删除在线分片、幂等回执） |
+| `GET /destructions/{id}` | 租户 | 查询销毁回执（覆盖谱系、阻断计数、删除分片数、销毁边界） |
 | `GET /audit/replay` | 租户 | 重放哈希链并验证完整性 |
 
 所有拒绝响应结构统一且确定性：
@@ -399,6 +487,7 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `MIGRATION_CONFLICT` | 同一 custody 存在其他 open 迁移会话，或该 custody 已迁移完成（不同幂等键不得重复迁移） |
 | `MIGRATION_COMPLETED` | 迁移会话已完成（新托管记录只生成一次） |
 | `MIGRATION_FAILED` | 迁移会话已因内存待累计分片丢失进入 failed 终态；用新（或同一）幂等键重新发起迁移 |
+| `CUSTODY_DESTROYED` | 托管记录（或其迁移谱系）已逻辑销毁：在线分片已删除、在途恢复/迁移已阻断；旧会话不再下发分片或密文（HTTP 410） |
 
 ---
 
@@ -481,6 +570,23 @@ open 唯一索引，等待中的旧会话请求只得 `MIGRATION_FAILED`，租�
 **新托管记录全局至多一条**。幂等重放（含完成态）返回 200 与同一新 custody 标识，
 迁移全过程的响应、数据库与审计只出现 ID、版本摘要、点位和分片/秘密摘要，不出现任何明文。
 
+**托管记录谱系逻辑销毁（v1.6）**
+销毁是一次**单事务、行锁串行**的在线逻辑擦除。谱系只沿**已完成迁移边**
+（`migration_sessions.new_custody_id IS NOT NULL`）向前展开：`open/failed/expired` 迁移不产生
+后代，故不存在“通过在途迁移绕过销毁”的后代。展开以**不动点逐轮加锁**完成——每轮先按 id 顺序
+`SELECT … FOR UPDATE` 锁定新发现的后代 custody 行，再沿其出边扩展，直到集合收敛；这与迁移门限
+提交、恢复份额提交共用同一全局锁序（**custody 行先于会话行**），因此销毁 × 迁移完成 × 分片领取
+× 份额提交**不可能死锁**，且交错结果只有两种确定性结局：迁移先提交则销毁在下一轮展开中看到
+新后代并把其分片一并删除（**绝不漏删**）；销毁先提交则排队中的旧会话拿锁后经守卫只得到
+`CUSTODY_DESTROYED`，既不再下发分片明文/一次性密文，其事务也已整体回滚、**插不进漏删后代**。
+同一事务内：谱系 custody 置 `destroyed`（保留无秘密墓碑）、在线 `shards` 密文行 `DELETE`、
+谱系上 `open` 的恢复/迁移会话置 `destroyed` 终态、写 `destruction.complete` 审计与幂等回执；
+事务**提交成功后**才按会话键 `pending.clear()` 清掉进程内待累计分片（沿用“提交后清内存”的边界，
+失败整体回滚则不清）。销毁回执 `destructions` 以 `(tenant_id, idempotency_key_hash)` 唯一约束
+保证同键重试永远返回同一份回执；销毁只覆盖**在线服务数据**（回执
+`scope=online_service_data_only`），**不宣称擦除外部备份**——快照/备份/对象存储版本/客户端缓存
+等副本的擦除须由其自身生命周期与介质策略保证。
+
 **审计：按序、可重放、不泄密**
 `audit_log` 仅追加，每条记录 `seq`（事务级 advisory lock 串行分配）与
 `entry_hash = SHA256(规范字段 || prev_hash)`，形成哈希链；`GET /audit/replay`
@@ -499,9 +605,10 @@ pip install -r requirements.txt
 # 准备一个 PostgreSQL 16，设置 KEYVAULT_DATABASE_URL 后：
 python -m app.seed                      # 建表 + 演示身份
 uvicorn app.main:app --reload --port 8000
-KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移，108 项）
+KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移与谱系销毁）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片故障转移回归（37 项）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D8）
 ```
 
 ## 6. 生产注意（本仓库为演示强化基线，上线前至少完成）

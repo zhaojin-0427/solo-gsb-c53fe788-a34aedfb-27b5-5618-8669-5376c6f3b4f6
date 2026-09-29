@@ -114,6 +114,7 @@ async def main() -> int:
     cuds = {c["name"]: Client(c["name"], c["api_key"]) for c in creds["custodians"]}
     ckeys = {c["name"]: c for c in creds["custodians"]}
     admin = Client("admin", creds["admin_api_key"])
+    dest_other = None
 
     try:
         # 每次运行使用唯一策略后缀，保证脚本在持久库上可重复执行
@@ -976,6 +977,177 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("db: migration tables contain no plaintext", False, repr(exc))
 
+        # ==================================================================
+        # 托管记录谱系逻辑销毁（v1.6）
+        # ==================================================================
+        # 构造一条“已完成迁移链”：c0 --migrate--> c1 --migrate--> c2，
+        # 销毁根 c0 必须沿迁移关系覆盖 c0/c1/c2 全部三代；同时在 c1 上挂一个
+        # 在途恢复会话、在 c2 上挂一个在途迁移会话，验证同事务阻断。
+        dpol0 = f"pol_d0_{suffix}"
+        dpol1 = f"pol_d1_{suffix}"
+        dpol2 = f"pol_d2_{suffix}"
+        dpol3 = f"pol_d3_{suffix}"
+        for pid in (dpol0, dpol1, dpol2, dpol3):
+            r = await tenant.call("POST", "/policies", json={
+                "policy_id": pid, "threshold": 2,
+                "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+                "epoch": epoch})
+            assert r.status_code == 201, r.text
+
+        async def full_migrate(src_cid: str, tgt_pol: str, idem: str) -> str:
+            r = await tenant.call("POST", "/migrations", headers={"Idempotency-Key": idem},
+                                  json={"source_custody_id": src_cid,
+                                        "target_policy_id": tgt_pol, "target_version": 1})
+            assert r.status_code == 201, r.text
+            mid = body_of(r)["migration_id"]
+            for cname in ("alice", "bob"):
+                prepped = await mig_prep(cname, mid)
+                rr = await cuds[cname].call("POST", "/migrations/shares", json={
+                    "migration_id": mid, "nonce": prepped["nonce"],
+                    "point_x": prepped["claim"]["point_x"],
+                    "shard_hex": prepped["claim"]["shard_hex"],
+                    "signature": prepped["signature"]})
+                assert rr.status_code == 200, rr.text
+            return body_of(rr)["new_custody_id"]
+
+        destroy_secret = b"lineage-destruction-secret-0123456789"
+        r = await tenant.call("POST", "/custodies",
+                              json={"policy_id": dpol0, "expected_version": 1,
+                                    "secret_hex": destroy_secret.hex()})
+        c0 = r.json()["custody_id"]
+        c1 = await full_migrate(c0, dpol1, f"d-hop1-{suffix}")
+        c2 = await full_migrate(c1, dpol2, f"d-hop2-{suffix}")
+        lineage = {c0, c1, c2}
+
+        # 在途恢复（c1）与在途迁移（c2 -> dpol3）
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": c1, "request_digest": request_digest,
+                                    "recovery_public_key": wrap_pub})
+        d_rec = r.json()
+        assert r.status_code == 201, r.text
+        d_nonce = (await cuds["alice"].call("POST", "/recoveries/nonces",
+                                            json={"session_id": d_rec["session_id"]})).json()["nonce"]
+        d_claim = (await claim("alice", d_rec["session_id"], d_nonce)).json()
+        r = await tenant.call("POST", "/migrations", headers={"Idempotency-Key": f"d-open-{suffix}"},
+                              json={"source_custody_id": c2, "target_policy_id": dpol3,
+                                    "target_version": 1})
+        d_mig = body_of(r)["migration_id"]
+        assert r.status_code == 201, r.text
+
+        # 缺少幂等键 -> BAD_REQUEST
+        await expect_error(tenant, "destruction without idempotency key", "POST",
+                           "/destructions", "BAD_REQUEST", json={"root_custody_id": c0})
+
+        # 跨租户销毁 -> FORBIDDEN（独立租户）
+        r = await admin.call("POST", "/admin/tenants", json={"name": f"dest-tenant-{suffix}"})
+        check("admin registers destruction tenant", r.status_code == 201, r.text)
+        dest_other = Client("dest-tenant", r.json()["api_key"])
+        await expect_error(dest_other, "cross-tenant destruction", "POST", "/destructions",
+                           "FORBIDDEN", headers={"Idempotency-Key": f"d-xt-{suffix}"},
+                           json={"root_custody_id": c0})
+
+        # 执行谱系销毁
+        idem_d = f"destroy-{suffix}"
+        r = await tenant.call("POST", "/destructions", headers={"Idempotency-Key": idem_d},
+                              json={"root_custody_id": c0})
+        rcpt = body_of(r)
+        check("destruction 201 receipt covers 3-generation lineage",
+              r.status_code == 201 and rcpt["custody_count"] == 3
+              and set(rcpt["custody_ids"]) == lineage
+              and rcpt["shards_deleted"] == 9
+              and rcpt["recovery_blocked"] == 1 and rcpt["migration_blocked"] == 1
+              and rcpt["scope"] == "online_service_data_only", r.text)
+        check("destruction response leaks no secret",
+              destroy_secret.hex() not in r.text)
+        des_id = rcpt["destruction_id"]
+
+        # 同键重试 -> 200 同一回执
+        r = await tenant.call("POST", "/destructions", headers={"Idempotency-Key": idem_d},
+                              json={"root_custody_id": c0})
+        check("destruction idempotent replay -> 200 same receipt",
+              r.status_code == 200 and body_of(r)["destruction_id"] == des_id
+              and body_of(r)["custody_ids"] == rcpt["custody_ids"], r.text)
+        # GET 销毁回执
+        r = await tenant.call("GET", f"/destructions/{des_id}")
+        check("GET destruction receipt by id",
+              r.status_code == 200 and body_of(r)["destruction_id"] == des_id
+              and body_of(r)["shards_deleted"] == 9, r.text)
+        await expect_error(dest_other, "cross-tenant GET receipt", "GET",
+                           f"/destructions/{des_id}", "FORBIDDEN")
+
+        # 同键不同根 -> IDEMPOTENCY_CONFLICT
+        r = await tenant.call("POST", "/custodies",
+                              json={"policy_id": dpol3, "expected_version": 1, "secret_hex": "ab"})
+        d_extra = r.json()["custody_id"]
+        await expect_error(tenant, "destruction same key different root", "POST",
+                           "/destructions", "IDEMPOTENCY_CONFLICT",
+                           headers={"Idempotency-Key": idem_d},
+                           json={"root_custody_id": d_extra})
+        # 不同键对已毁根再销毁：零增量回执（幂等收敛，不报错）
+        r = await tenant.call("POST", "/destructions",
+                              headers={"Idempotency-Key": f"destroy-again-{suffix}"},
+                              json={"root_custody_id": c0})
+        ra = body_of(r)
+        check("re-destroy destroyed root with new key -> zero-effect receipt",
+              r.status_code == 201 and ra["shards_deleted"] == 0
+              and ra["custody_count"] == 3 and ra["recovery_blocked"] == 0, r.text)
+
+        # 在途恢复/迁移已被阻断：旧会话一切操作 -> CUSTODY_DESTROYED(410)
+        for cname, method, path, payload in (
+            ("alice", "POST", "/recoveries/shares", {
+                "session_id": d_rec["session_id"], "nonce": d_nonce,
+                "point_x": d_claim["point_x"], "shard_hex": d_claim["shard_hex"],
+                "signature": sign(ckeys["alice"]["signing_private_key"], d_claim["signing_message"])}),
+            ("bob", "POST", "/recoveries/nonces", {"session_id": d_rec["session_id"]}),
+            ("bob", "POST", "/migrations/nonces", {"migration_id": d_mig}),
+        ):
+            rr = await cuds[cname].call(method, path, json=payload)
+            check(f"{path} on destroyed lineage -> CUSTODY_DESTROYED",
+                  rr.status_code == 410 and body_of(rr)["error"]["code"] == "CUSTODY_DESTROYED",
+                  rr.text[:200])
+        r = await tenant.call("GET", f"/recoveries/{d_rec['session_id']}")
+        check("destroyed recovery session shows destroyed status",
+              body_of(r).get("status") == "destroyed", r.text)
+        r = await tenant.call("GET", f"/migrations/{d_mig}")
+        check("destroyed migration session shows destroyed status",
+              body_of(r).get("status") == "destroyed", r.text)
+        # 销毁后不得新建恢复/迁移
+        await expect_error(tenant, "recovery on destroyed custody", "POST", "/recoveries",
+                           "CUSTODY_DESTROYED",
+                           json={"custody_id": c2, "request_digest": request_digest,
+                                 "recovery_public_key": wrap_pub})
+        await expect_error(tenant, "migration on destroyed custody", "POST", "/migrations",
+                           "CUSTODY_DESTROYED",
+                           headers={"Idempotency-Key": f"d-m-{suffix}"},
+                           json={"source_custody_id": c1, "target_policy_id": dpol3,
+                                 "target_version": 1})
+        # 存储层：在线分片密文已删除，墓碑保留（无秘密）
+        try:
+            import asyncpg
+
+            dsn = os.environ.get("KEYVAULT_DATABASE_URL", "postgresql://keyvault@db:5432/keyvault")
+            try:
+                conn = await asyncpg.connect(dsn)
+            except Exception:
+                conn = await asyncpg.connect(host="/tmp", user="keyvault", database="keyvault")
+            try:
+                n_shards = await conn.fetchval(
+                    "SELECT count(*) FROM shards WHERE custody_id = ANY($1::text[])",
+                    list(lineage))
+                check("db: online encrypted shards deleted for full lineage", n_shards == 0,
+                      str(n_shards))
+                n_tomb = await conn.fetchval(
+                    "SELECT count(*) FROM key_custodies WHERE id = ANY($1::text[]) "
+                    "AND status='destroyed' AND destroyed_at IS NOT NULL", list(lineage))
+                check("db: secret-free tombstones retained", n_tomb == 3, str(n_tomb))
+                n_receipt = await conn.fetchval(
+                    "SELECT count(*) FROM destructions WHERE id=$1 AND custody_count=3", des_id)
+                check("db: destruction receipt persisted", n_receipt == 1, str(n_receipt))
+            finally:
+                await conn.close()
+        except Exception as exc:  # noqa: BLE001
+            check("db: destruction storage assertions", False, repr(exc))
+
         # --- 审计哈希链重放 -------------------------------------------------
         r = await tenant.call("GET", "/audit/replay")
         chain = r.json()
@@ -991,6 +1163,7 @@ async def main() -> int:
             "recovery.shard.claim", "recovery.share.submit",
             "migration.start", "migration.nonce.issue", "migration.shard.claim",
             "migration.share.submit", "migration.complete",
+            "destruction.complete",
         }
         check("audit covers key lifecycle actions", expect_actions.issubset(actions),
               str(sorted(expect_actions - actions)))
@@ -1004,6 +1177,10 @@ async def main() -> int:
         for c in cuds.values():
             await c.close()
         await admin.close()
+        try:
+            await dest_other.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     failed = [n for n, ok, _ in results if not ok]
     print("\n" + "=" * 70)

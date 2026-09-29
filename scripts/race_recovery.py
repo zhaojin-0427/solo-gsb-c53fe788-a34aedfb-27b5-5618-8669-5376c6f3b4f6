@@ -143,7 +143,8 @@ async def wait_lock_waiters(pool, session_id: str, expect: int, timeout: float =
         JOIN pg_stat_activity a ON a.pid = l.pid
         WHERE l.locktype = 'transactionid'
           AND NOT l.granted
-          AND a.query LIKE '%recovery_sessions%FOR UPDATE%'
+          AND (a.query LIKE '%recovery_sessions%FOR UPDATE%'
+               OR a.query LIKE '%key_custodies%FOR UPDATE%')
     """
     deadline = asyncio.get_event_loop().time() + timeout
     seen = 0

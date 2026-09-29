@@ -40,6 +40,7 @@ from ..errors import (
     E_BAD_REQUEST,
     E_BAD_SIGNATURE,
     E_CROSS_POLICY_SHARE,
+    E_CUSTODY_DESTROYED,
     E_DUPLICATE_SHARE,
     E_EPOCH_EXPIRED,
     E_EPOCH_REVOKED,
@@ -118,6 +119,33 @@ async def _source_shard(conn, custody_id: str, custodian_id: str):
     )
 
 
+async def _lock_source_custody(conn, mig):
+    """Lock the lineage source custody in the global order and detect destruction.
+
+    Every migration gate (nonce / claim / submit) takes the source custody row
+    lock before acting, so a concurrent logical destruction has a deterministic
+    ordering: once it commits, a queued gate re-reads ``destroyed`` and fails
+    with CUSTODY_DESTROYED instead of issuing a nonce or handing out a shard.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, status FROM key_custodies WHERE id=$1 FOR UPDATE",
+        mig["source_custody_id"],
+    )
+    if row is None:
+        raise ApiError(
+            E_INTEGRITY,
+            basis={"reason": "source_custody_missing",
+                   "source_custody_id": mig["source_custody_id"]},
+        )
+    if row["status"] == "destroyed":
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"migration_id": mig["id"], "source_custody_id": mig["source_custody_id"],
+                   "reason": "source_custody_destroyed"},
+        )
+    return row
+
+
 async def _resolve_nonce(conn, migration_id: str, nonce_hex: str, custodian_id: str):
     try:
         nonce_hash = crypto.sha256_hex(bytes.fromhex(nonce_hex))
@@ -160,6 +188,15 @@ def _check_digests(mig, source_policy, target_policy) -> None:
 async def _guard_migration(conn, mig, source_policy, target_policy, now,
                            custodian_id: str | None) -> None:
     """Gates shared by nonce issue / shard claim / share submit."""
+    # 逻辑销毁终态：源记录谱系的在线分片已删除、迁移已被显式阻断。
+    # 销毁提交后旧会话的一切请求确定性拒绝——绝不再下发源分片，也绝不可能
+    # 完成迁移而生成“漏删的后代记录”。
+    if mig["status"] == "destroyed":
+        raise ApiError(
+            E_CUSTODY_DESTROYED,
+            basis={"migration_id": mig["id"], "reason": "migration_session_destroyed",
+                   "source_custody_id": mig["source_custody_id"]},
+        )
     if mig["status"] == "completed":
         raise ApiError(E_MIGRATION_COMPLETED, basis={"migration_id": mig["id"]})
     if mig["status"] == "failed":
@@ -245,6 +282,12 @@ async def start_migration(
                 if custody["tenant_id"] != tenant["id"]:
                     raise ApiError(E_FORBIDDEN,
                                    basis={"reason": "custody_belongs_to_other_tenant"})
+                # 已销毁记录（墓碑）不得再发起迁移：在线分片已删除。
+                if custody["status"] == "destroyed":
+                    raise ApiError(
+                        E_CUSTODY_DESTROYED,
+                        basis={"custody_id": custody["id"], "custody_status": custody["status"]},
+                    )
                 # 惰性过期：超过 TTL、或源侧已失效（custody 被轮换/撤销、源策略
                 # 版本被撤销/过期）的 open 会话在同源新事务（本事务随后提交）中
                 # 置 expired，释放两条部分唯一索引——失败后可用同键或新键安全重试，
@@ -271,12 +314,13 @@ async def start_migration(
                 now = await conn.fetchval("SELECT now()")
 
                 # 幂等重放优先：同键的已有会话（open/completed）原样返回；
-                # expired/failed 行不占位（唯一索引不含二者），终态失败后
-                # 允许用同一幂等键（或新键）从源记录安全重新发起。
+                # expired/failed/destroyed 行不占位（唯一索引不含三者），
+                # 终态后允许用同一幂等键（或新键）从源记录安全重新发起；
+                # destroyed 的源记录随后在下方以 CUSTODY_DESTROYED 确定性拒绝。
                 existing = await conn.fetchrow(
                     "SELECT * FROM migration_sessions "
                     "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
-                    "AND status NOT IN ('expired','failed') "
+                    "AND status NOT IN ('expired','failed','destroyed') "
                     "ORDER BY created_at DESC LIMIT 1",
                     tenant["id"], idem_hash,
                 )
@@ -538,11 +582,17 @@ async def issue_nonce(body: MigrationNonceRequestIn, request: Request,
         tx = conn.transaction()
         await tx.start()
         try:
+            # 全局锁序：源 custody 行先于 migration 会话行（与销毁/提交一致，
+            # 杜绝销毁 × nonce 发放的锁序反转死锁）。
             mig_row = await conn.fetchrow(
-                "SELECT * FROM migration_sessions WHERE id=$1 FOR UPDATE", body.migration_id
+                "SELECT * FROM migration_sessions WHERE id=$1", body.migration_id
             )
             if mig_row is None:
                 raise ApiError(E_NOT_FOUND, basis={"migration_id": body.migration_id})
+            await _lock_source_custody(conn, mig_row)
+            mig_row = await conn.fetchrow(
+                "SELECT * FROM migration_sessions WHERE id=$1 FOR UPDATE", body.migration_id
+            )
             sess_tenant = mig_row["tenant_id"]
             source_policy = await repo.get_policy_version(
                 conn, mig_row["source_policy_id"], mig_row["source_version"]
@@ -552,7 +602,7 @@ async def issue_nonce(body: MigrationNonceRequestIn, request: Request,
             )
             now = await conn.fetchval("SELECT now()")
             await _guard_migration(conn, mig_row, source_policy, target_policy, now,
-                                   custodian["id"])
+                                   custodian_id=custodian["id"])
 
             shard = await _source_shard(conn, mig_row["source_custody_id"], custodian["id"])
             if shard is None:
@@ -628,11 +678,17 @@ async def claim_shard(body: MigrationShardClaimIn, request: Request,
         tx = conn.transaction()
         await tx.start()
         try:
+            # 全局锁序：源 custody 行先于 migration 会话行（与销毁/提交一致，
+            # 杜绝销毁 × 领片的锁序反转死锁；排队领片在销毁后只得到 410）。
             mig = await conn.fetchrow(
-                "SELECT * FROM migration_sessions WHERE id=$1 FOR UPDATE", body.migration_id
+                "SELECT * FROM migration_sessions WHERE id=$1", body.migration_id
             )
             if mig is None:
                 raise ApiError(E_NOT_FOUND, basis={"migration_id": body.migration_id})
+            await _lock_source_custody(conn, mig)
+            mig = await conn.fetchrow(
+                "SELECT * FROM migration_sessions WHERE id=$1 FOR UPDATE", body.migration_id
+            )
             sess_tenant = mig["tenant_id"]
             source_policy = await repo.get_policy_version(
                 conn, mig["source_policy_id"], mig["source_version"]
@@ -746,12 +802,20 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
             await tx.rollback()
 
         try:
+            # 全局锁序：源 custody 行先于 migration 会话行——与逻辑销毁、恢复
+            # 提交路径完全一致，销毁 × 迁移完成永不死锁：销毁先拿到源 custody
+            # 则本路径等锁，拿锁后只得到 CUSTODY_DESTROYED；本路径先拿锁则
+            # 销毁等待迁移提交完成，随后谱系展开把新后代一并纳入销毁（不漏删）。
+            mig = await conn.fetchrow(
+                "SELECT * FROM migration_sessions WHERE id=$1", body.migration_id
+            )
+            if mig is None:
+                raise ApiError(E_NOT_FOUND, basis={"migration_id": body.migration_id})
+            await _lock_source_custody(conn, mig)
             mig = await conn.fetchrow(
                 "SELECT * FROM migration_sessions WHERE id=$1 FOR UPDATE", body.migration_id
             )
             await faults.maybe_park(request, "migration.after_lock")
-            if mig is None:
-                raise ApiError(E_NOT_FOUND, basis={"migration_id": body.migration_id})
             sess_tenant = mig["tenant_id"]
             source_policy = await repo.get_policy_version(
                 conn, mig["source_policy_id"], mig["source_version"]
@@ -981,8 +1045,10 @@ async def _resplit(conn, pending, mig, source_policy, target_policy):
                    "threshold": source_policy["threshold"]},
         )
     points = points[: source_policy["threshold"]]
+    # 源 custody 行锁已由 submit_share 按全局锁序先行持有（此处 FOR UPDATE
+    # 为锁内重读，幂等无等待）：迁移提交与逻辑销毁据此确定唯一先后。
     source_custody = await conn.fetchrow(
-        "SELECT * FROM key_custodies WHERE id=$1", mig["source_custody_id"]
+        "SELECT * FROM key_custodies WHERE id=$1 FOR UPDATE", mig["source_custody_id"]
     )
     try:
         secret = crypto.shamir_combine(points, source_custody["secret_length"])

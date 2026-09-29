@@ -58,11 +58,14 @@ CREATE TABLE IF NOT EXISTS key_custodies (
     secret_digest     TEXT NOT NULL,
     secret_length     INTEGER NOT NULL,
     epoch_index       INTEGER NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'active',  -- active | rotated | revoked
+    status            TEXT NOT NULL DEFAULT 'active',  -- active | rotated | revoked | destroyed
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    destroyed_at      TIMESTAMPTZ,
     FOREIGN KEY (policy_id, policy_version) REFERENCES policies(id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_custody_tenant ON key_custodies(tenant_id);
+-- 旧库平滑升级：destroyed_at 随 v1.6 逻辑销毁引入。
+ALTER TABLE key_custodies ADD COLUMN IF NOT EXISTS destroyed_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS shards (
     id              TEXT PRIMARY KEY,
@@ -84,7 +87,7 @@ CREATE TABLE IF NOT EXISTS recovery_sessions (
     policy_version    INTEGER NOT NULL,
     epoch_index       INTEGER NOT NULL,
     request_digest    TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'open',  -- open | completed
+    status            TEXT NOT NULL DEFAULT 'open',  -- open | completed | destroyed
     recovery_pubkey   TEXT NOT NULL,
     valid_until       TIMESTAMPTZ NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -132,7 +135,7 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
     target_version      INTEGER NOT NULL,
     target_digest       TEXT NOT NULL,          -- 创建时固化的目标策略版本摘要
     idempotency_key_hash TEXT NOT NULL,         -- 只存幂等键摘要
-    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired | failed
+    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired | failed | destroyed
     new_custody_id      TEXT REFERENCES key_custodies(id),
     valid_until         TIMESTAMPTZ NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -176,6 +179,28 @@ CREATE TABLE IF NOT EXISTS migration_share_submissions (
 CREATE INDEX IF NOT EXISTS idx_migration_share_session ON migration_share_submissions(migration_id);
 ALTER TABLE migration_share_submissions ADD COLUMN IF NOT EXISTS point_x INTEGER;
 ALTER TABLE migration_share_submissions ADD COLUMN IF NOT EXISTS shard_digest TEXT;
+
+-- 逻辑销毁回执：租户以幂等键发起，对指定托管记录沿“已完成迁移关系”
+-- 找出全部后代，在同一事务内阻断在途恢复/迁移、标记记录已销毁并删除在线
+-- 加密分片；本表只保存无秘密的回执（ID/摘要/计数），不保存任何分片或秘密。
+-- 销毁仅覆盖服务在线数据，不宣称擦除外部备份。
+CREATE TABLE IF NOT EXISTS destructions (
+    id                    TEXT PRIMARY KEY,
+    tenant_id             TEXT NOT NULL REFERENCES tenants(id),
+    root_custody_id       TEXT NOT NULL REFERENCES key_custodies(id),
+    idempotency_key_hash  TEXT NOT NULL,            -- 只存幂等键摘要
+    custody_count         INTEGER NOT NULL,         -- 本次覆盖的谱系记录数
+    recovery_blocked      INTEGER NOT NULL,         -- 置 destroyed 的在途恢复会话数
+    migration_blocked     INTEGER NOT NULL,         -- 置 destroyed 的在途迁移会话数
+    shards_deleted        INTEGER NOT NULL,         -- 删除的在线加密分片数
+    custody_ids           JSONB NOT NULL,           -- 谱系全部 custody id（含根）
+    status                TEXT NOT NULL DEFAULT 'completed',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_destruction_tenant ON destructions(tenant_id);
+-- 幂等回执：同租户同一幂等键至多一份销毁回执（重放返回同一销毁回执）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_destruction_idem
+    ON destructions(tenant_id, idempotency_key_hash);
 
 -- 仅追加、哈希链审计日志（不含任何秘密材料）。
 CREATE TABLE IF NOT EXISTS audit_log (
